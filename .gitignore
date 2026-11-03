@@ -1,0 +1,11 @@
+node_modules/
+frontend/node_modules/
+frontend/dist/
+build/bin/
+build/windows/installer/
+*.log
+*.exe
+*.jar
+*.zip
+*.msi
+NUL
