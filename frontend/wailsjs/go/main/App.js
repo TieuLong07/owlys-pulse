@@ -10,6 +10,10 @@ export function GetBoostStatus() {
   return window['go']['main']['App']['GetBoostStatus']();
 }
 
+export function GetRecoveryError() {
+  return window['go']['main']['App']['GetRecoveryError']();
+}
+
 export function GetUnknownProcessesReport() {
   return window['go']['main']['App']['GetUnknownProcessesReport']();
 }
@@ -20,6 +24,10 @@ export function ListRunningProcesses() {
 
 export function ResumeProcess(arg1) {
   return window['go']['main']['App']['ResumeProcess'](arg1);
+}
+
+export function RetryRecovery() {
+  return window['go']['main']['App']['RetryRecovery']();
 }
 
 export function StartBoost(arg1) {

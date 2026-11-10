@@ -1,8 +1,11 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -126,47 +129,183 @@ func purgeWindowsStandbyList() error {
 	return nil
 }
 
-// enableMMCSSGamePriority boosts Multimedia Class Scheduler Service (MMCSS) Games profile & disables network throttling.
-func enableMMCSSGamePriority() error {
-	k, err := registry.OpenKey(
-		registry.LOCAL_MACHINE,
-		`SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games`,
-		registry.SET_VALUE,
-	)
-	if err == nil {
-		_ = k.SetDWordValue("GPU Priority", 8)
-		_ = k.SetDWordValue("Priority", 6)
-		_ = k.SetStringValue("Scheduling Category", "High")
-		_ = k.SetStringValue("SFIO Priority", "High")
-		_ = k.Close()
-	}
+// settingValue retains the registry type and bytes, including nonexistence.
+type settingValue struct {
+	Present bool
+	Type    uint32
+	Data    []byte
+}
+type savedSetting struct {
+	Key   string
+	Value settingValue
+}
+type settingStore interface {
+	read(string) (settingValue, error)
+	write(string, settingValue) error
+}
 
-	sysProfile, err := registry.OpenKey(
-		registry.LOCAL_MACHINE,
-		`SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile`,
-		registry.SET_VALUE,
-	)
-	if err == nil {
-		_ = sysProfile.SetDWordValue("NetworkThrottlingIndex", 0xFFFFFFFF)
-		_ = sysProfile.SetDWordValue("SystemResponsiveness", 0)
-		_ = sysProfile.Close()
+func snapshotSettings(s settingStore, keys []string) ([]savedSetting, error) {
+	out := make([]savedSetting, 0, len(keys))
+	for _, key := range keys {
+		value, err := s.read(key)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", key, err)
+		}
+		out = append(out, savedSetting{key, value})
+	}
+	return out, nil
+}
+func restoreSettings(s settingStore, saved []savedSetting) error {
+	var errs []error
+	for _, entry := range saved {
+		if err := s.write(entry.Key, entry.Value); err != nil {
+			errs = append(errs, fmt.Errorf("restore %s: %w", entry.Key, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+const mmcssProfile = `SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile`
+
+var mmcssNames = []string{"Games/GPU Priority", "Games/Priority", "Games/Scheduling Category", "Games/SFIO Priority", "NetworkThrottlingIndex", "SystemResponsiveness"}
+
+func canWriteMMCSS() error {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, mmcssProfile, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	return k.Close()
+}
+
+type registrySettings struct{}
+
+func (registrySettings) open(name string, access uint32) (registry.Key, string, error) {
+	path := mmcssProfile
+	if strings.HasPrefix(name, "Games/") {
+		path += `\Tasks\Games`
+		name = strings.TrimPrefix(name, "Games/")
+	}
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, path, access)
+	return k, name, err
+}
+func (r registrySettings) read(name string) (settingValue, error) {
+	k, value, err := r.open(name, registry.QUERY_VALUE)
+	if err != nil {
+		return settingValue{}, err
+	}
+	defer k.Close()
+	n, typ, err := k.GetValue(value, nil)
+	if errors.Is(err, registry.ErrNotExist) {
+		return settingValue{}, nil
+	}
+	if err != nil && !errors.Is(err, registry.ErrShortBuffer) {
+		return settingValue{}, err
+	}
+	buf := make([]byte, n)
+	for {
+		n, typ, err = k.GetValue(value, buf)
+		if errors.Is(err, registry.ErrShortBuffer) {
+			buf = make([]byte, n)
+			continue
+		}
+		if err != nil {
+			return settingValue{}, err
+		}
+		return settingValue{true, typ, buf[:n]}, nil
+	}
+}
+func (r registrySettings) write(name string, v settingValue) error {
+	k, value, err := r.open(name, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+	if !v.Present {
+		err = k.DeleteValue(value)
+		if errors.Is(err, registry.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	p, err := windows.UTF16PtrFromString(value)
+	if err != nil {
+		return err
+	}
+	return setRawRegistryValue(k, p, v)
+}
+
+var procRegSetValueEx = windows.NewLazySystemDLL("advapi32.dll").NewProc("RegSetValueExW")
+
+func setRawRegistryValue(k registry.Key, p *uint16, v settingValue) error {
+	var b uintptr
+	if len(v.Data) > 0 {
+		b = uintptr(unsafe.Pointer(&v.Data[0]))
+	}
+	status, _, _ := procRegSetValueEx.Call(uintptr(k), uintptr(unsafe.Pointer(p)), 0, uintptr(v.Type), b, uintptr(len(v.Data)))
+	if status != 0 {
+		return windows.Errno(status)
 	}
 	return nil
 }
-
-// restoreMMCSSGamePriority restores default Windows MMCSS values after boost stops.
-func restoreMMCSSGamePriority() error {
-	sysProfile, err := registry.OpenKey(
-		registry.LOCAL_MACHINE,
-		`SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile`,
-		registry.SET_VALUE,
-	)
-	if err == nil {
-		_ = sysProfile.SetDWordValue("NetworkThrottlingIndex", 10)
-		_ = sysProfile.SetDWordValue("SystemResponsiveness", 20)
-		_ = sysProfile.Close()
+func mmcssBoostValue(name string) settingValue {
+	var v uint32
+	switch name {
+	case "Games/GPU Priority":
+		v = 8
+	case "Games/Priority":
+		v = 6
+	case "NetworkThrottlingIndex":
+		v = 0xffffffff
+	case "SystemResponsiveness":
+		v = 0
+	default:
+		data := windows.StringToUTF16("High")
+		raw := make([]byte, len(data)*2)
+		for i, c := range data {
+			raw[i*2] = byte(c)
+			raw[i*2+1] = byte(c >> 8)
+		}
+		return settingValue{true, registry.SZ, raw}
 	}
-	return nil
+	return settingValue{true, registry.DWORD, []byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)}}
+}
+func applyMMCSSSettings(s settingStore) ([]savedSetting, error) {
+	saved, err := snapshotSettings(s, mmcssNames)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range mmcssNames {
+		if err = s.write(name, mmcssBoostValue(name)); err != nil {
+			return nil, errors.Join(fmt.Errorf("boost %s: %w", name, err), restoreSettings(s, saved))
+		}
+	}
+	return saved, nil
+}
+
+// Registry, power scheme and foreground process state live in memory until restoration.
+// A durable booster snapshot must serialize these if crash recovery is required.
+var mmcssSaved []savedSetting
+
+// enableMMCSSGamePriority snapshots every touched value (including absent values) before writing.
+func enableMMCSSGamePriority() error {
+	if mmcssSaved != nil {
+		return nil
+	}
+	saved, err := applyMMCSSSettings(registrySettings{})
+	if err == nil {
+		mmcssSaved = saved
+	}
+	return err
+}
+func restoreMMCSSGamePriority() error {
+	if mmcssSaved == nil {
+		return nil
+	}
+	err := restoreSettings(registrySettings{}, mmcssSaved)
+	if err == nil {
+		mmcssSaved = nil
+	}
+	return err
 }
 
 // disableWindowsTransparency turns off Windows shell transparency effects and returns the previous value.
@@ -214,65 +353,249 @@ func restartExplorerShell() error {
 	return hiddenWindowsCommand("explorer.exe").Start()
 }
 
-// applyExtremeModeII executes deep service blackout, CPU unparking, and foreground game I/O + Page priority elevation.
-func applyExtremeModeII() ([]string, error) {
-	var stopped []string
-	for _, svc := range extremeIIServices {
-		running, err := isWindowsServiceRunning(svc)
-		if err != nil || !running {
-			continue
-		}
-		if err := stopWindowsService(svc); err == nil {
-			stopped = append(stopped, svc)
-		}
-	}
-
-	// Unpark all CPU cores in current power scheme (PROCTHROTTLEMIN = 100%, CPMINCORES = 100%)
-	_ = hiddenWindowsCommand("powercfg", "-setacvalueindex", "scheme_current", "sub_processor", "CPMINCORES", "100").Run()
-	_ = hiddenWindowsCommand("powercfg", "-setacvalueindex", "scheme_current", "sub_processor", "PROCTHROTTLEMIN", "100").Run()
-	_ = hiddenWindowsCommand("powercfg", "-setactive", "scheme_current").Run()
-
-	// Boost foreground process priority if it is not Owlys Pulse or Explorer
-	boostForegroundProcessPriority()
-
-	return stopped, nil
+// extremePowerState captures the exact active scheme and its AC settings.
+type extremePowerState struct {
+	Scheme               string
+	CoreMin, ThrottleMin uint32
+}
+type powerSettings interface {
+	currentScheme() (string, error)
+	readAC(string, string) (uint32, error)
+	writeAC(string, string, uint32) error
+	activate(string) error
 }
 
-func restoreExtremeModeII(stoppedServices []string) error {
-	for _, svc := range stoppedServices {
-		_ = startWindowsService(svc)
+func applyExtremePower(p powerSettings) (extremePowerState, error) {
+	scheme, err := p.currentScheme()
+	if err != nil {
+		return extremePowerState{}, err
 	}
-	// Restore balanced processor minimum state (5%)
-	_ = hiddenWindowsCommand("powercfg", "-setacvalueindex", "scheme_current", "sub_processor", "PROCTHROTTLEMIN", "5").Run()
-	_ = hiddenWindowsCommand("powercfg", "-setactive", "scheme_current").Run()
-	return nil
+	core, err := p.readAC(scheme, "CPMINCORES")
+	if err != nil {
+		return extremePowerState{}, err
+	}
+	throttle, err := p.readAC(scheme, "PROCTHROTTLEMIN")
+	if err != nil {
+		return extremePowerState{}, err
+	}
+	saved := extremePowerState{scheme, core, throttle}
+	if err = p.writeAC(scheme, "CPMINCORES", 100); err != nil {
+		return saved, err
+	}
+	if err = p.writeAC(scheme, "PROCTHROTTLEMIN", 100); err != nil {
+		return saved, errors.Join(err, restoreExtremePower(p, saved))
+	}
+	if err = p.activate(scheme); err != nil {
+		return saved, errors.Join(err, restoreExtremePower(p, saved))
+	}
+	return saved, nil
+}
+func restoreExtremePower(p powerSettings, s extremePowerState) error {
+	if s.Scheme == "" {
+		return nil
+	}
+	err1 := p.writeAC(s.Scheme, "CPMINCORES", s.CoreMin)
+	err2 := p.writeAC(s.Scheme, "PROCTHROTTLEMIN", s.ThrottleMin)
+	err3 := p.activate(s.Scheme)
+	return errors.Join(err1, err2, err3)
 }
 
-func boostForegroundProcessPriority() {
+type windowsPowerSettings struct{}
+
+func (windowsPowerSettings) currentScheme() (string, error) {
+	b, err := hiddenWindowsCommand("powercfg", "-getactivescheme").Output()
+	if err != nil {
+		return "", err
+	}
+	text := string(b)
+	start := strings.Index(text, "(")
+	if start < 0 {
+		return "", fmt.Errorf("powercfg active scheme: %q", text)
+	}
+	text = text[:start]
+	parts := strings.Fields(text)
+	if len(parts) == 0 {
+		return "", fmt.Errorf("powercfg active scheme: empty")
+	}
+	return parts[len(parts)-1], nil
+}
+func (windowsPowerSettings) readAC(scheme, key string) (uint32, error) {
+	b, err := hiddenWindowsCommand("powercfg", "-query", scheme, "sub_processor", key).Output()
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.Contains(strings.ToLower(line), "current ac power setting index") {
+			parts := strings.Fields(line)
+			if len(parts) > 0 {
+				v, e := strconv.ParseUint(strings.TrimPrefix(strings.ToLower(parts[len(parts)-1]), "0x"), 16, 32)
+				return uint32(v), e
+			}
+		}
+	}
+	return 0, fmt.Errorf("powercfg AC index not found for %s", key)
+}
+func (windowsPowerSettings) writeAC(scheme, key string, v uint32) error {
+	return hiddenWindowsCommand("powercfg", "-setacvalueindex", scheme, "sub_processor", key, strconv.FormatUint(uint64(v), 10)).Run()
+}
+func (windowsPowerSettings) activate(scheme string) error {
+	return hiddenWindowsCommand("powercfg", "-setactive", scheme).Run()
+}
+
+// foregroundPriorityState records PID and each independent priority setting.
+type foregroundPriorityState struct{ PID, Class, IO, Page uint32 }
+type prioritySettings interface {
+	foregroundPID() (uint32, error)
+	readPriorities(uint32) (uint32, uint32, uint32, error)
+	writeClass(uint32, uint32) error
+	writeIO(uint32, uint32) error
+	writePage(uint32, uint32) error
+}
+
+func applyForegroundPriority(p prioritySettings) (foregroundPriorityState, error) {
+	pid, err := p.foregroundPID()
+	if err != nil || pid <= 4 || int(pid) == os.Getpid() {
+		return foregroundPriorityState{}, err
+	}
+	class, io, page, err := p.readPriorities(pid)
+	if err != nil {
+		return foregroundPriorityState{}, err
+	}
+	saved := foregroundPriorityState{pid, class, io, page}
+	if err = p.writeClass(pid, highPriorityClass); err != nil {
+		return saved, err
+	}
+	if err = p.writeIO(pid, 3); err != nil {
+		return saved, errors.Join(err, restoreForegroundPriority(p, saved))
+	}
+	if err = p.writePage(pid, 5); err != nil {
+		return saved, errors.Join(err, restoreForegroundPriority(p, saved))
+	}
+	return saved, nil
+}
+func restoreForegroundPriority(p prioritySettings, s foregroundPriorityState) error {
+	if s.PID == 0 {
+		return nil
+	}
+	return errors.Join(p.writeClass(s.PID, s.Class), p.writeIO(s.PID, s.IO), p.writePage(s.PID, s.Page))
+}
+
+var procGetPriorityClass = kernel32.NewProc("GetPriorityClass")
+var procNtQueryInfoProcess = ntdll.NewProc("NtQueryInformationProcess")
+
+type windowsPrioritySettings struct{}
+
+func (windowsPrioritySettings) foregroundPID() (uint32, error) {
 	hwnd, _, _ := procGetForegroundWindow.Call()
 	if hwnd == 0 {
-		return
+		return 0, nil
 	}
-	var fgPID uint32
-	procGetWindowThreadPID.Call(hwnd, uintptr(unsafe.Pointer(&fgPID)))
-	if fgPID <= 4 || int(fgPID) == os.Getpid() {
-		return
-	}
-
-	handle, err := windows.OpenProcess(processSetInformation|processQueryLimitedInfo, false, fgPID)
+	var pid uint32
+	procGetWindowThreadPID.Call(hwnd, uintptr(unsafe.Pointer(&pid)))
+	return pid, nil
+}
+func openPriorityProcess(pid uint32) (windows.Handle, error) {
+	return windows.OpenProcess(processSetInformation|processQueryLimitedInfo, false, pid)
+}
+func (windowsPrioritySettings) readPriorities(pid uint32) (uint32, uint32, uint32, error) {
+	h, err := openPriorityProcess(pid)
 	if err != nil {
-		return
+		return 0, 0, 0, err
 	}
-	defer windows.CloseHandle(handle)
+	defer windows.CloseHandle(h)
+	class, _, callErr := procGetPriorityClass.Call(uintptr(h))
+	if class == 0 {
+		return 0, 0, 0, callErr
+	}
+	var io, page uint32
+	for _, entry := range []struct {
+		kind uintptr
+		out  *uint32
+	}{{processIoPriorityClass, &io}, {processPagePriorityClass, &page}} {
+		status, _, e := procNtQueryInfoProcess.Call(uintptr(h), entry.kind, uintptr(unsafe.Pointer(entry.out)), unsafe.Sizeof(io), 0)
+		if status != 0 {
+			return 0, 0, 0, fmt.Errorf("NtQueryInformationProcess(%d): 0x%x: %v", entry.kind, status, e)
+		}
+	}
+	return uint32(class), io, page, nil
+}
+func (windowsPrioritySettings) writeClass(pid, v uint32) error {
+	h, err := openPriorityProcess(pid)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(h)
+	ok, _, e := procSetPriorityClass.Call(uintptr(h), uintptr(v))
+	if ok == 0 {
+		return e
+	}
+	return nil
+}
+func writeProcessPriority(pid uint32, kind uintptr, v uint32) error {
+	h, err := openPriorityProcess(pid)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(h)
+	status, _, e := procNtSetInfoProcess.Call(uintptr(h), kind, uintptr(unsafe.Pointer(&v)), unsafe.Sizeof(v))
+	if status != 0 {
+		return fmt.Errorf("NtSetInformationProcess(%d): 0x%x: %v", kind, status, e)
+	}
+	return nil
+}
+func (windowsPrioritySettings) writeIO(pid, v uint32) error {
+	return writeProcessPriority(pid, processIoPriorityClass, v)
+}
+func (windowsPrioritySettings) writePage(pid, v uint32) error {
+	return writeProcessPriority(pid, processPagePriorityClass, v)
+}
 
-	// Set HIGH_PRIORITY_CLASS
-	procSetPriorityClass.Call(uintptr(handle), uintptr(highPriorityClass))
+// Keep the legacy booster API; typed state is also available to durable snapshots.
+var extremePowerSaved extremePowerState
+var foregroundSaved foregroundPriorityState
 
-	// Set IoPriority = High (3) and PagePriority = 5
-	ioPrio := uint32(3)
-	procNtSetInfoProcess.Call(uintptr(handle), uintptr(processIoPriorityClass), uintptr(unsafe.Pointer(&ioPrio)), unsafe.Sizeof(ioPrio))
-	pagePrio := uint32(5)
-	procNtSetInfoProcess.Call(uintptr(handle), uintptr(processPagePriorityClass), uintptr(unsafe.Pointer(&pagePrio)), unsafe.Sizeof(pagePrio))
+func applyExtremeModeII() ([]string, error) {
+	power, err := applyExtremePower(windowsPowerSettings{})
+	if err != nil {
+		return nil, err
+	}
+	extremePowerSaved = power
+	fg, err := applyForegroundPriority(windowsPrioritySettings{})
+	if err != nil {
+		_ = restoreExtremePower(windowsPowerSettings{}, power)
+		extremePowerSaved = extremePowerState{}
+		return nil, err
+	}
+	foregroundSaved = fg
+	var stopped []string
+	for _, svc := range extremeIIServices {
+		running, e := isWindowsServiceRunning(svc)
+		if e == nil && running {
+			if stopWindowsService(svc) == nil {
+				stopped = append(stopped, svc)
+			}
+		}
+	}
+	return stopped, nil
+}
+func restoreExtremeModeII(stoppedServices []string) error {
+	var errs []error
+	for _, svc := range stoppedServices {
+		if err := startWindowsService(svc); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := restoreForegroundPriority(windowsPrioritySettings{}, foregroundSaved); err != nil {
+		errs = append(errs, err)
+	} else {
+		foregroundSaved = foregroundPriorityState{}
+	}
+	if err := restoreExtremePower(windowsPowerSettings{}, extremePowerSaved); err != nil {
+		errs = append(errs, err)
+	} else {
+		extremePowerSaved = extremePowerState{}
+	}
+	return errors.Join(errs...)
 }
 
 // selfTrimPulseMemory trims Owlys Pulse's own working set so the booster itself consumes minimal physical RAM while gaming.

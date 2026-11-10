@@ -6,11 +6,15 @@ export function ExportUnknownProcessesReport():Promise<main.UnknownProcessReport
 
 export function GetBoostStatus():Promise<main.BoostStatus>;
 
+export function GetRecoveryError():Promise<string>;
+
 export function GetUnknownProcessesReport():Promise<main.UnknownProcessReport>;
 
 export function ListRunningProcesses():Promise<Array<main.RunningProcess>>;
 
 export function ResumeProcess(arg1:number):Promise<main.BoostStatus>;
+
+export function RetryRecovery():Promise<void>;
 
 export function StartBoost(arg1:main.BoostRequest):Promise<main.BoostStatus>;
 

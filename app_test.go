@@ -1,6 +1,8 @@
 package main
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestListRunningProcessesUsesTasklistOutput(t *testing.T) {
 	app := NewApp()

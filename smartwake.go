@@ -155,18 +155,11 @@ func (w *SmartWakeWatcher) checkForegroundTarget(pid int, _ string, _ bool) {
 
 		// Re-freeze the woken app to restore maximum resources for the game!
 		if w.engine != nil && w.engine.SuspendPID != nil {
-			status := w.engine.Status()
-			var foundProc *RunningProcess
-			for _, p := range status.SuspendedApps {
-				if p.PID == primaryPID {
-					foundProc = &p
-					break
-				}
-			}
+			// The watcher already owns this process list. Never acquire the
+			// engine lock while holding w.mu (Stop takes locks in reverse order).
+			proc, ok := w.suspendedMap[primaryPID]
 			targets := []int{primaryPID}
-			if foundProc != nil && len(foundProc.PIDs) > 0 {
-				targets = foundProc.PIDs
-			} else if proc, ok := w.suspendedMap[primaryPID]; ok && len(proc.PIDs) > 0 {
+			if ok && len(proc.PIDs) > 0 {
 				targets = proc.PIDs
 			}
 
@@ -176,9 +169,6 @@ func (w *SmartWakeWatcher) checkForegroundTarget(pid int, _ string, _ bool) {
 						_ = w.engine.TrimPIDWorkingSet(targetPID)
 					}
 				}
-			}
-			if foundProc != nil {
-				w.suspendedMap[primaryPID] = *foundProc
 			}
 		}
 		delete(w.temporarilyWoken, primaryPID)

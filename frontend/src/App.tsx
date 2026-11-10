@@ -26,6 +26,7 @@ import {
   StopBoost,
 } from '../wailsjs/go/main/App';
 import {main} from '../wailsjs/go/models';
+import {summarizeBoost} from './boostSummary';
 import './App.css';
 
 type Page = 'overview' | 'settings';
@@ -36,26 +37,27 @@ const WINDOWS_SERVICES = [
   {
     id: 'WSearch',
     name: 'Windows Search (WSearch)',
-    desc: 'Tạm dừng lập chỉ mục tìm kiếm ổ đĩa trong phiên chơi game.',
+    desc: 'Có thể tạm dừng lập chỉ mục tìm kiếm trong phiên Boost.',
   },
   {
     id: 'SysMain',
     name: 'SysMain (Superfetch)',
-    desc: 'Giảm đọc/ghi bộ nhớ đệm nền khi game đang tải map lớn.',
+    desc: 'Có thể tạm dừng SysMain nếu dịch vụ đang chạy.',
   },
   {
     id: 'DiagTrack',
     name: 'Connected User Experiences (DiagTrack)',
-    desc: 'Tạm ngưng thu thập chẩn đoán nền của Windows.',
+    desc: 'Có thể tạm dừng dịch vụ chẩn đoán nền nếu đang chạy.',
   },
   {
     id: 'Spooler',
     name: 'Print Spooler',
-    desc: 'Tạm dừng dịch vụ máy in nếu bạn không in ấn khi chơi.',
+    desc: 'Có thể tạm dừng dịch vụ máy in nếu bạn không cần in.',
   },
 ];
 
 function formatRAM(kb: number): string {
+  if (!kb || kb <= 0) return '0 MB';
   if (kb >= 1024 * 1024) {
     return `${(kb / 1024 / 1024).toFixed(1)} GB`;
   }
@@ -67,7 +69,6 @@ function App() {
   const [overviewTab, setOverviewTab] = useState<OverviewTab>('options');
   const [processes, setProcesses] = useState<main.RunningProcess[]>([]);
   const [selectedPIDs, setSelectedPIDs] = useState<Set<number>>(new Set());
-  const [autoSeeded, setAutoSeeded] = useState(false);
   const [loadingProcs, setLoadingProcs] = useState(false);
   const [busyBoost, setBusyBoost] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
@@ -75,15 +76,18 @@ function App() {
   const [filterMode, setFilterMode] = useState<FilterMode>('all');
   const [unknownReport, setUnknownReport] = useState<main.UnknownProcessReport | null>(null);
   const [savedNotice, setSavedNotice] = useState('');
+  const [lastRestore, setLastRestore] = useState<{
+    instances: number; applied: string[]
+  } | null>(null);
 
   // Main Boost Options
   const [pauseApps, setPauseApps] = useState(true);
   const [smartWake, setSmartWake] = useState(true);
   const [trimWorkingSet, setTrimWorkingSet] = useState(true);
-  const [purgeStandby, setPurgeStandby] = useState(true);
+  const [purgeStandby, setPurgeStandby] = useState(false);
   const [timerResolution05ms, setTimerResolution05ms] = useState(true);
   const [mmcssGpuPriority, setMmcssGpuPriority] = useState(true);
-  const [reduceWindowsTasks, setReduceWindowsTasks] = useState(true);
+  const [reduceWindowsTasks, setReduceWindowsTasks] = useState(false);
   const [highPerformance, setHighPerformance] = useState(true);
   const [extremeModeI, setExtremeModeI] = useState(false);
   const [extremeModeII, setExtremeModeII] = useState(false);
@@ -234,9 +238,15 @@ function App() {
       });
       const status = await StartBoost(req);
       setBoostStatus(status);
+      if (status.active) setLastRestore(null);
       await loadSystemState(true);
-    } catch {
-      setErrorMsg('Không thể kích hoạt Game Boost. Vui lòng thử lại.');
+      if (status.warnings?.length) setErrorMsg(status.warnings.join(' · '));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const status = await GetBoostStatus().catch(() => null);
+      if (status) setBoostStatus(status);
+      await loadSystemState(true);
+      setErrorMsg(`Không thể kích hoạt Game Boost: ${detail}`);
     } finally {
       setBusyBoost(false);
     }
@@ -245,12 +255,22 @@ function App() {
   const handleStopBoost = async () => {
     setBusyBoost(true);
     setErrorMsg('');
+    setLastRestore(null);
+    const before = summarizeBoost(boostStatus);
     try {
       const status = await StopBoost();
       setBoostStatus(status);
+      if (!status.active) {
+        setLastRestore({instances: before.instances, applied: before.applied});
+      }
+      if (status.warnings?.length) {
+        setErrorMsg(status.warnings.join(' · '));
+      }
       await loadSystemState(true);
     } catch {
-      setErrorMsg('Không thể khôi phục trạng thái phiên boost.');
+      const status = await GetBoostStatus().catch(() => null);
+      if (status) setBoostStatus(status);
+      setErrorMsg('Khôi phục chưa hoàn tất. Kiểm tra cảnh báo bên dưới và thử lại.');
     } finally {
       setBusyBoost(false);
     }
@@ -273,20 +293,18 @@ function App() {
 
   const restoreDefaultSettings = () => {
     setPauseApps(true);
-    setSmartWake(true);
     setTrimWorkingSet(true);
-    setPurgeStandby(true);
-    setTimerResolution05ms(true);
-    setMmcssGpuPriority(true);
-    setReduceWindowsTasks(true);
-    setHighPerformance(true);
-    setExtremeModeI(false);
-    setExtremeModeII(false);
+    setPurgeStandby(false);
+    setTimerResolution05ms(false);
+    setMmcssGpuPriority(false);
+    setReduceWindowsTasks(false);
+    setHighPerformance(false);
     setSelectedServices(['WSearch', 'SysMain', 'DiagTrack']);
     selectRecommended();
   };
 
   const isBoosting = boostStatus.active;
+  const boostSummary = summarizeBoost(boostStatus);
 
   return (
     <div className={`app-shell ${isBoosting ? 'is-active' : ''}`}>
@@ -328,11 +346,11 @@ function App() {
         <div className="sidebar-footer">
           <div className="status-pill">
             <span className="status-dot" />
-            <span>{isBoosting ? 'Đang tối ưu hệ thống' : 'Sẵn sàng tăng tốc'}</span>
+            <span>{isBoosting ? 'Đang Boost' : 'Sẵn sàng Boost'}</span>
           </div>
           <p>
             {isBoosting
-              ? 'Mọi thay đổi sẽ tự động hoàn tác khi bạn tắt Boost hoặc đóng ứng dụng.'
+              ? 'Nhấn Dừng Boost để khôi phục. Nếu có lỗi, xem cảnh báo và thử lại.'
               : 'Không cần chọn game. Bật Boost bất cứ lúc nào trước hoặc trong khi chơi.'}
           </p>
         </div>
@@ -351,7 +369,7 @@ function App() {
             <header className="page-header">
               <div className="page-header-copy">
                 <h1>Tăng tốc hệ thống</h1>
-                <p>Giải phóng tài nguyên nền và ưu tiên hiệu năng CPU ngay khi bạn vào game.</p>
+                <p>Ngủ đông ứng dụng nền, dọn sạch bộ nhớ và ưu tiên tài nguyên tối đa cho trận game của bạn.</p>
               </div>
               <button
                 type="button"
@@ -378,7 +396,7 @@ function App() {
                     </h2>
                     <p>
                       {isBoosting
-                        ? `Đã đóng băng ${boostStatus.suspendedApps.length} ứng dụng nền và chuyển nguồn điện sang hiệu năng cao.`
+                        ? `Đã đưa ${boostSummary.instances} tiến trình nền vào ngủ đông an toàn.`
                         : 'Chỉ đóng băng tạm thời ứng dụng bạn chọn, không tắt ngang hay làm mất dữ liệu đang mở.'}
                     </p>
                   </div>
@@ -398,7 +416,7 @@ function App() {
                   <button
                     type="button"
                     className="cta-btn primary"
-                    disabled={busyBoost}
+                    disabled={busyBoost || loadingProcs}
                     onClick={() => void handleStartBoost()}
                   >
                     <Lightning size={18} weight="fill" />
@@ -409,51 +427,72 @@ function App() {
 
               <div className="hero-metrics">
                 <div className="metric-item">
-                  <span>Ứng dụng nền tạm dừng</span>
+                  <span>Tiến trình tạm dừng</span>
                   <strong>
                     {isBoosting
-                      ? `${boostStatus.suspendedApps.length} đang tạm dừng`
+                      ? `${boostSummary.instances} tiến trình`
                       : pauseApps
-                        ? `${selectedPIDs.size} ứng dụng đã chọn`
+                        ? `${selectedPIDs.size} nhóm đã chọn`
                         : 'Đang tắt'}
                   </strong>
                 </div>
                 <div className="metric-item">
-                  <span>Bộ nhớ nền giải tỏa</span>
+                  <span>RAM giải phóng tạm thời</span>
                   <strong>
                     {isBoosting
-                      ? formatRAM(boostStatus.savedMemoryKB)
+                      ? formatRAM(boostSummary.workingSetKB)
                       : pauseApps
                         ? `~${formatRAM(estimatedMemoryKB)}`
                         : '0 MB'}
                   </strong>
+                  <small>{isBoosting ? 'Đã thu hồi Working Set' : 'Ước tính theo app đã chọn'}</small>
                 </div>
                 <div className="metric-item">
-                  <span>Chế độ tối ưu Kernel</span>
+                  <span>Thay đổi đã áp dụng</span>
                   <strong>
                     {isBoosting
-                      ? boostStatus.extremeIIActive
-                        ? 'Extreme II (Vắt kiệt)'
-                        : boostStatus.extremeIActive
-                          ? 'Extreme I (Tắt Shell)'
-                          : 'Chuẩn + Timer 0.5ms'
-                      : extremeModeII
-                        ? 'Extreme II (Vắt kiệt)'
-                        : extremeModeI
-                          ? 'Extreme I (Tắt Shell)'
-                          : timerResolution05ms
-                            ? 'Timer 0.5ms + ISLC'
-                            : 'Tiêu chuẩn'}
+                      ? boostSummary.applied.length ? boostSummary.applied.join(' · ') : 'Đóng băng ứng dụng'
+                      : 'Xem các tùy chọn bên dưới'}
                   </strong>
                 </div>
               </div>
             </section>
 
+            {isBoosting && (
+              <section className="boost-report" role="status">
+                <strong>Đã kích hoạt Game Boost!</strong>
+                <p>
+                  Đã đưa {boostSummary.instances} tiến trình nền vào ngủ đông, giải phóng tạm thời khoảng {formatRAM(boostSummary.workingSetKB)} RAM cho game. Phím tắt khôi phục: <code>Ctrl + Alt + Shift + R</code> hoặc <code>Ctrl + Shift + F12</code>. Chúc bạn chơi game mượt mà!
+                </p>
+              </section>
+            )}
+
+            {(isBoosting && (boostStatus.warnings?.length ?? 0) > 0) && (
+              <section className="boost-report warning" role="alert">
+                <strong>Cảnh báo phiên Boost</strong>
+                <ul>{boostStatus.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul>
+              </section>
+            )}
+            {!isBoosting && lastRestore && (
+              <section className="boost-report" role="status">
+                <strong>Đã khôi phục toàn bộ hệ thống!</strong>
+                <p>
+                  Phiên chơi đã kết thúc. Pulse đã rã đông thành công {lastRestore.instances} tiến trình và trả lại 100% trạng thái Windows (Nguồn điện, Services, MMCSS). Hệ thống sẵn sàng cho công việc bình thường!
+                </p>
+              </section>
+            )}
+            {!isBoosting && (boostStatus.warnings?.length ?? 0) > 0 && (
+              <section className="boost-report warning" role="alert">
+                <strong>Cảnh báo khôi phục</strong>
+                <ul>{boostStatus.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul>
+              </section>
+            )}
+
             {isBoosting && boostStatus.suspendedApps.length > 0 && (
               <section className="panel suspended-panel">
                 <div className="panel-header">
                   <div className="panel-header-copy">
-                    <h3>Ứng dụng đang tạm dừng ({boostStatus.suspendedApps.length})</h3>
+                    <h3>Nhóm ứng dụng đang tạm dừng ({boostStatus.suspendedApps.length} nhóm · {boostSummary.instances} tiến trình)</h3>
                     <p>Bạn có thể khôi phục riêng từng ứng dụng ngay trong lúc đang chơi game.</p>
                   </div>
                 </div>
@@ -544,7 +583,7 @@ function App() {
                         <div className="option-copy">
                           <strong>Đóng băng & Thu hồi RAM ứng dụng nền (Suspend + EmptyWorkingSet)</strong>
                           <p>
-                            Đóng băng CPU về 0% cho {selectedPIDs.size} ứng dụng đã chọn ({formatRAM(estimatedMemoryKB)}) và ép rút toàn bộ Working Set xuống Pagefile.
+                            Tạm dừng các tiến trình đã chọn; có thể thử gọt working set. {formatRAM(estimatedMemoryKB)} là tổng working set được ghi nhận trước Boost, không phải RAM sẽ giải phóng.
                           </p>
                         </div>
                       </div>
@@ -573,9 +612,9 @@ function App() {
                           <Eye size={18} />
                         </div>
                         <div className="option-copy">
-                          <strong>Smart-Wake chống đánh thức bừa bãi (Dwell Filter + Auto Re-Freeze)</strong>
+                          <strong>Smart-Wake (Tự động đánh thức khi dùng & Đóng băng lại)</strong>
                           <p>
-                            Chỉ rã đông khi bạn cố tình click hoặc Alt+Tab vào app quá 250ms (chặn hoàn toàn IPC nền gọi ngầm). Tự động đóng băng + gọt RAM lại khi quay về game.
+                            Theo dõi cửa sổ đang dùng: chỉ rã đông khi bạn Alt+Tab vào ứng dụng quá 250ms, và tự động đóng băng lại khi quay về game.
                           </p>
                         </div>
                       </div>
@@ -595,7 +634,7 @@ function App() {
                         <div className="option-copy">
                           <strong>Xả bộ nhớ đệm Standby List chuẩn ISLC (NtSetSystemInformation)</strong>
                           <p>
-                            Dọn sạch các trang bộ nhớ đệm bị Windows giữ lì trong RAM để chống khựng khung hình (stutter) trên máy ít RAM.
+                            Yêu cầu Windows xả standby list; kết quả phụ thuộc hệ thống, không đảm bảo giảm giật hình.
                           </p>
                         </div>
                       </div>
@@ -613,21 +652,40 @@ function App() {
                           <Timer size={18} />
                         </div>
                         <div className="option-copy">
-                          <strong>Ép xung nhịp bộ đếm Kernel 0.5ms & Ưu tiên GPU/MMCSS</strong>
+                          <strong>Kernel Timer 0.5ms & MMCSS Gaming Priority</strong>
                           <p>
-                            Hạ Timer Resolution từ 15.6ms xuống 0.5ms, đặt GPU Priority = 8, tắt Network Throttling và ưu tiên High Performance.
+                            Kéo độ trễ clock kernel từ 15.6ms xuống 0.5ms và ưu tiên luồng Multimedia của Windows cho game để giảm micro-stutter.
                           </p>
                         </div>
                       </div>
                       <div className="option-controls">
                         <Switch
-                          checked={timerResolution05ms && mmcssGpuPriority}
+                          checked={timerResolution05ms}
                           onChange={() => {
-                            const next = !(timerResolution05ms && mmcssGpuPriority);
+                            const next = !timerResolution05ms;
                             setTimerResolution05ms(next);
                             setMmcssGpuPriority(next);
-                            setHighPerformance(next);
                           }}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="option-row">
+                      <div className="option-left">
+                        <div className="option-icon">
+                          <Gauge size={18} />
+                        </div>
+                        <div className="option-copy">
+                          <strong>Chuyển chế độ Nguồn Hiệu năng cao (High Performance)</strong>
+                          <p>
+                            Ép CPU không hạ xung đột ngột giữa các pha combat nặng. Tự động trả về gói nguồn gốc khi dừng Boost.
+                          </p>
+                        </div>
+                      </div>
+                      <div className="option-controls">
+                        <Switch
+                          checked={highPerformance}
+                          onChange={() => setHighPerformance((v) => !v)}
                         />
                       </div>
                     </div>
@@ -638,9 +696,9 @@ function App() {
                           <ShieldCheck size={18} />
                         </div>
                         <div className="option-copy">
-                          <strong>Giảm tác vụ & dịch vụ Windows nền</strong>
+                          <strong>Tạm dừng dịch vụ Windows nền (Search, SysMain, Telemetry...)</strong>
                           <p>
-                            Tạm dừng {selectedServices.length} dịch vụ ngốn I/O đĩa ({selectedServices.join(', ')}) và bật lại sau khi thoát.
+                            Tạm dừng các dịch vụ ngốn đĩa SSD và RAM khi chơi game. Khởi động lại nguyên trạng sau khi kết thúc phiên.
                           </p>
                         </div>
                       </div>
@@ -666,22 +724,18 @@ function App() {
                         </div>
                         <div className="option-copy">
                           <div className="option-title-line">
-                            <strong>Extreme Mode I — Tắt Windows Shell (explorer.exe) & Hiệu ứng kính</strong>
-                            <span className="extreme-badge">Máy yếu</span>
+                            <strong>Extreme Mode I — Tắt Windows Shell (explorer.exe)</strong>
+                            <span className="extreme-badge">Console Mode</span>
                           </div>
                           <p>
-                            Tạm đóng màn hình nền, thanh Taskbar và hiệu ứng trong suốt để thu hồi ~200MB RAM + VRAM. Tự mở lại Explorer khi dừng Boost.
+                            Tạm tắt thanh Taskbar & hiệu ứng kính để thu hồi RAM & VRAM. Tự động phục hồi ngay khi dừng Boost hoặc dùng phím cứu hộ.
                           </p>
                         </div>
                       </div>
                       <div className="option-controls">
                         <Switch
                           checked={extremeModeI}
-                          onChange={() => {
-                            const next = !extremeModeI;
-                            setExtremeModeI(next);
-                            if (!next) setExtremeModeII(false);
-                          }}
+                          onChange={() => setExtremeModeI((v) => !v)}
                         />
                       </div>
                     </div>
@@ -693,11 +747,11 @@ function App() {
                         </div>
                         <div className="option-copy">
                           <div className="option-title-line">
-                            <strong>Extreme Mode II — Vắt kiệt phần cứng (Zero-OS Overhead)</strong>
-                            <span className="extreme2-badge">Siêu cực đoan</span>
+                            <strong>Extreme Mode II — Vắt kiệt tài nguyên (14 dịch vụ & Core Parking)</strong>
+                            <span className="extreme2-badge">Max Power</span>
                           </div>
                           <p>
-                            Bao gồm Extreme I + cắt thêm 14 dịch vụ nền Windows, mở khóa 100% Core Parking, nâng I/O + Page Priority cho game và tự ép nhỏ RAM của chính Owlys Pulse.
+                            Bao gồm Extreme I + cắt 14 dịch vụ Windows không cần thiết, mở khóa 100% Core Parking và tự thu nhỏ bộ nhớ của chính Pulse.
                           </p>
                         </div>
                       </div>
@@ -839,7 +893,7 @@ function App() {
                 <div className="panel-header-copy">
                   <h3>Dịch vụ Windows tạm dừng khi Boost</h3>
                   <p>
-                    Chỉ những dịch vụ đang chạy mới được tạm dừng và tự động khởi động lại sau khi tắt Boost.
+                    Chỉ thử tạm dừng dịch vụ đang chạy. Dừng Boost sẽ thử khôi phục dịch vụ đã thay đổi; nếu thất bại, xem cảnh báo và thử lại.
                   </p>
                 </div>
               </div>
@@ -881,9 +935,9 @@ function App() {
                       <ShieldCheck size={18} />
                     </div>
                     <div className="option-copy">
-                      <strong>Tự động khôi phục khi thoát đột ngột (Crash-Safe Snapshot)</strong>
+                      <strong>Nhật ký khôi phục khi phiên bị gián đoạn</strong>
                       <p>
-                        Trạng thái tiến trình và Power Plan gốc được lưu cục bộ. Nếu máy mất điện hoặc đóng app, lần mở tiếp theo sẽ tự khôi phục.
+                        Ghi lại thay đổi trước khi áp dụng. Khi mở lại, ứng dụng thử khôi phục phần còn lại; nếu chưa xong, Boost mới bị khóa và bạn có thể thử lại.
                       </p>
                     </div>
                   </div>
@@ -894,9 +948,9 @@ function App() {
                       <Cpu size={18} />
                     </div>
                     <div className="option-copy">
-                      <strong>Không xả RAM ảo (No Working-Set Flush)</strong>
+                      <strong>Gọt working set là tùy chọn</strong>
                       <p>
-                        Owlys Pulse không ép xóa bộ nhớ làm việc gây giật lag page-fault như các phần mềm dọn RAM cũ.
+                        Có thể yêu cầu gọt bộ nhớ làm việc của tiến trình được chọn. Chỉ số này không đo RAM thực sự được giải phóng hoặc hiệu năng game.
                       </p>
                     </div>
                   </div>
@@ -955,13 +1009,14 @@ function App() {
   );
 }
 
-function Switch({checked, onChange}: {checked: boolean; onChange: () => void}) {
+function Switch({checked, onChange, disabled = false}: {checked: boolean; onChange: () => void; disabled?: boolean}) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
-      aria-label="Bật hoặc tắt tùy chọn"
+      aria-label={disabled ? 'Tùy chọn chưa hỗ trợ' : 'Bật hoặc tắt tùy chọn'}
+      disabled={disabled}
       className={`switch ${checked ? 'checked' : ''}`}
       onClick={onChange}
     >

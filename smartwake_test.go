@@ -5,6 +5,30 @@ import (
 	"time"
 )
 
+func TestSmartWakeRefreezeDoesNotAcquireEngineLock(t *testing.T) {
+	e := &BoostEngine{SuspendPID: func(int) error { return nil }}
+	w := NewSmartWakeWatcher(e)
+	w.DwellRequired = 0
+	w.ReFreezeCooldown = 0
+	w.SetSuspended([]RunningProcess{{PID: 1234, PIDs: []int{1234}}})
+	w.checkForegroundTarget(1234, "", false)
+	w.checkForegroundTarget(1234, "", false)
+	w.checkForegroundTarget(5678, "", false)
+	e.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		w.checkForegroundTarget(5678, "", false)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		e.mu.Unlock()
+		t.Fatal("SmartWake acquired engine lock under watcher lock")
+	}
+	e.mu.Unlock()
+}
+
 func TestSmartWakeWatcherResumesForegroundProcessSafely(t *testing.T) {
 	var resumedPIDs []int
 	var trimmedPIDs []int
